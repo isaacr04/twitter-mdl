@@ -36,6 +36,10 @@ The app requires the following permissions:
 
 ## Installation
 
+## Releases
+
+Download the [latest release](https://github.com/isaacr04/twitter-mdl/releases/latest) and install the .apk file. Must allow `Install from Unknown Sources`.
+
 The app can be installed on any Android device running Android 7.0 (API 24) or higher.
 
 

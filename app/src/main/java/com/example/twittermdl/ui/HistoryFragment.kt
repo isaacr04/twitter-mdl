@@ -1,5 +1,7 @@
 package com.example.twittermdl.ui
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
@@ -53,6 +55,19 @@ class HistoryFragment : Fragment() {
                     "Download deleted",
                     Toast.LENGTH_SHORT
                 ).show()
+            },
+            onItemClick = { history ->
+                // Open the tweet URL in browser
+                try {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(history.tweetUrl))
+                    startActivity(intent)
+                } catch (e: Exception) {
+                    Toast.makeText(
+                        requireContext(),
+                        "Unable to open tweet URL",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
             }
         )
 

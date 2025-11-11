@@ -1,5 +1,7 @@
 package com.example.twittermdl.ui
 
+import android.content.ClipboardManager
+import android.content.Context
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
@@ -35,6 +37,42 @@ class DownloadFragment : Fragment() {
         setupRecyclerView()
         setupListeners()
         observeViewModel()
+        checkClipboardForTwitterUrl()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Check clipboard again when fragment becomes visible
+        checkClipboardForTwitterUrl()
+    }
+
+    private fun checkClipboardForTwitterUrl() {
+        try {
+            val clipboard = requireContext().getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clipData = clipboard.primaryClip
+
+            if (clipData != null && clipData.itemCount > 0) {
+                val text = clipData.getItemAt(0).text?.toString() ?: return
+
+                // Check if it's a Twitter/X URL and the input field is empty
+                if (isTwitterUrl(text) && binding.urlInput.text.isNullOrEmpty()) {
+                    binding.urlInput.setText(text)
+                    Toast.makeText(
+                        requireContext(),
+                        "Twitter URL detected from clipboard",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        } catch (e: Exception) {
+            // Silently fail - clipboard access is optional
+            android.util.Log.d("DownloadFragment", "Failed to read clipboard: ${e.message}")
+        }
+    }
+
+    private fun isTwitterUrl(url: String): Boolean {
+        val regex = """(?:https?://)?(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+""".toRegex()
+        return regex.containsMatchIn(url)
     }
 
     private fun setupRecyclerView() {

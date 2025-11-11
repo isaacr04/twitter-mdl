@@ -72,6 +72,7 @@ dependencies {
     // Image Loading
     implementation("io.coil-kt:coil:2.5.0")
     implementation("io.coil-kt:coil-gif:2.5.0")
+    implementation("io.coil-kt:coil-video:2.5.0")
 
     // RecyclerView
     implementation("androidx.recyclerview:recyclerview:1.3.2")

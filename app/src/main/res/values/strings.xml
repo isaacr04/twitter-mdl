@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Twitter Media Downloader</string>
+    <string name="url_hint">Paste Twitter/X URL here</string>
+    <string name="fetch_button">Fetch Tweet</string>
+    <string name="download_button">Download Selected</string>
+    <string name="download_all">Download All</string>
+    <string name="history_tab">History</string>
+    <string name="download_tab">Download</string>
+    <string name="settings_tab">Settings</string>
+    <string name="login_title">Login for Sensitive Content</string>
+    <string name="username_hint">Username or Email</string>
+    <string name="password_hint">Password</string>
+    <string name="login_button">Login</string>
+    <string name="logout_button">Logout</string>
+    <string name="logged_in_as">Logged in as: %s</string>
+    <string name="not_logged_in">Not logged in</string>
+    <string name="redownload">Redownload</string>
+    <string name="delete">Delete</string>
+    <string name="select_media">Select media to download:</string>
+    <string name="no_downloads_yet">No downloads yet</string>
+    <string name="downloading">Downloading…</string>
+    <string name="fetching_tweet">Fetching tweet data…</string>
+    <string name="error_occurred">Error: %s</string>
+    <string name="download_complete">Download complete!</string>
+    <string name="author">Author:</string>
+    <string name="posted_on">Posted on:</string>
+    <string name="downloaded_on">Downloaded on:</string>
+</resources>

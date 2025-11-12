@@ -8,17 +8,24 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.viewModelScope
+import androidx.work.Constraints
+import androidx.work.Data
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import com.example.twittermdl.data.*
 import com.example.twittermdl.network.MediaDownloader
 import com.example.twittermdl.network.TwitterApiService
 import com.example.twittermdl.repository.DownloadRepository
 import com.example.twittermdl.utils.JsonUtils
 import com.example.twittermdl.utils.PreferencesManager
+import com.example.twittermdl.worker.GifGenerationWorker
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -27,6 +34,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val twitterApiService = TwitterApiService()
     private val mediaDownloader = MediaDownloader(application)
     private val preferencesManager = PreferencesManager(application)
+    private val workManager = WorkManager.getInstance(application)
 
     val allDownloads: Flow<List<DownloadHistory>> = repository.allDownloads
     val userCredentials: Flow<UserCredentials?> = preferencesManager.userCredentials
@@ -49,6 +57,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // Track GIF generation progress for each history ID
     private val _gifGenerationProgress = MutableLiveData<Map<Long, GifGenerationProgress>>()
     val gifGenerationProgress: LiveData<Map<Long, GifGenerationProgress>> = _gifGenerationProgress
+
+    // Track WorkManager work IDs for each history ID
+    private val gifWorkIds = mutableMapOf<Long, UUID>()
+
+    // Track WorkManager LiveData instances for cleanup
+    private val workInfoObservers = mutableMapOf<UUID, androidx.lifecycle.Observer<WorkInfo>>()
 
     fun fetchTweetData(url: String) {
         viewModelScope.launch {
@@ -79,90 +93,62 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     if (existingHistoryId != null) " (redownload for history ID: $existingHistoryId)" else "")
 
             try {
-                val downloadedPaths = mutableListOf<String>()
-                val mediaUrls = mutableListOf<String>()
-                val mediaTypes = mutableListOf<String>()
-
-                var thumbnailPath: String? = null
-                var firstVideoPath: String? = null
-                var firstVideoTweetId: String? = null
+                val totalMediaCount = selectedMedia.size
+                val createdHistoryIds = mutableListOf<Long>()
 
                 selectedMedia.forEachIndexed { index, media ->
-                    Log.d("MainViewModel", "Downloading media ${index + 1}/${selectedMedia.size}: ${media.type}")
+                    Log.d("MainViewModel", "Downloading media ${index + 1}/$totalMediaCount: ${media.type}")
 
                     val result = mediaDownloader.downloadMedia(
                         media,
                         tweetData.tweetId
                     ) { progress ->
                         _downloadProgress.postValue(
-                            ((index.toFloat() / selectedMedia.size) * 100 +
-                            (progress.toFloat() / selectedMedia.size)).toInt()
+                            ((index.toFloat() / totalMediaCount) * 100 +
+                            (progress.toFloat() / totalMediaCount)).toInt()
                         )
                     }
 
                     result.onSuccess { path ->
                         Log.d("MainViewModel", "Downloaded successfully: $path")
-                        downloadedPaths.add(path)
-                        mediaUrls.add(media.url)
-                        mediaTypes.add(media.type.name)
 
-                        // Use first media as thumbnail
-                        if (thumbnailPath == null) {
-                            try {
-                                if (media.type == MediaType.VIDEO) {
-                                    // Save video path for async GIF generation
-                                    firstVideoPath = path
-                                    firstVideoTweetId = tweetData.tweetId
+                        // Generate thumbnail for this specific media item
+                        var thumbnailPath: String? = null
+                        var videoPath: String? = null
 
-                                    // Extract static thumbnail from the video
-                                    Log.d("MainViewModel", "Extracting static thumbnail from video")
-                                    val thumbResult = mediaDownloader.extractStaticThumbnail(path, tweetData.tweetId)
-                                    thumbResult.onSuccess {
-                                        thumbnailPath = it
-                                        Log.d("MainViewModel", "Static thumbnail extracted: $it")
-                                    }.onFailure { error ->
-                                        Log.e("MainViewModel", "Static thumbnail extraction failed: ${error.message}", error)
-                                    }
-                                } else {
-                                    // For images and GIFs, use the downloaded file as thumbnail
-                                    val thumbUrl = media.thumbnailUrl ?: media.url
-                                    Log.d("MainViewModel", "Downloading thumbnail for ${media.type}: $thumbUrl")
+                        try {
+                            if (media.type == MediaType.VIDEO) {
+                                // Save video path for async GIF generation
+                                videoPath = path
 
-                                    val thumbResult = mediaDownloader.downloadThumbnail(thumbUrl, tweetData.tweetId)
-                                    thumbResult.onSuccess {
-                                        thumbnailPath = it
-                                        Log.d("MainViewModel", "Thumbnail downloaded: $it")
-                                    }.onFailure { error ->
-                                        Log.e("MainViewModel", "Thumbnail download failed: ${error.message}", error)
-                                    }
+                                // Extract static thumbnail from the video
+                                Log.d("MainViewModel", "Extracting static thumbnail from video (media $index)")
+                                val thumbResult = mediaDownloader.extractStaticThumbnail(path, "${tweetData.tweetId}_$index")
+                                thumbResult.onSuccess {
+                                    thumbnailPath = it
+                                    Log.d("MainViewModel", "Static thumbnail extracted: $it")
+                                }.onFailure { error ->
+                                    Log.e("MainViewModel", "Static thumbnail extraction failed: ${error.message}", error)
                                 }
-                            } catch (e: Exception) {
-                                // Don't let thumbnail generation failures break downloads
-                                Log.e("MainViewModel", "Thumbnail generation failed", e)
-                            }
-                        }
-                    }.onFailure { error ->
-                        Log.e("MainViewModel", "Download failed: ${error.message}", error)
-                        _errorMessage.postValue("Failed to download media: ${error.message}")
-                    }
-                }
+                            } else {
+                                // For images and GIFs, use the downloaded file as thumbnail
+                                val thumbUrl = media.thumbnailUrl ?: media.url
+                                Log.d("MainViewModel", "Downloading thumbnail for ${media.type} (media $index): $thumbUrl")
 
-                // Save or update history entry
-                val historyId = if (existingHistoryId != null) {
-                    // Update existing history entry for redownload
-                    val existingHistory = repository.getDownloadById(existingHistoryId)
-                    if (existingHistory != null) {
-                        val updatedHistory = existingHistory.copy(
-                            downloadDate = System.currentTimeMillis(),
-                            thumbnailPath = thumbnailPath,
-                            localFilePaths = JsonUtils.listToJson(downloadedPaths)
-                        )
-                        repository.update(updatedHistory)
-                        Log.d("MainViewModel", "Updated existing history entry ID: $existingHistoryId")
-                        existingHistoryId
-                    } else {
-                        // Fallback: create new entry if existing not found
-                        Log.w("MainViewModel", "Existing history not found, creating new entry")
+                                val thumbResult = mediaDownloader.downloadThumbnail(thumbUrl, "${tweetData.tweetId}_$index")
+                                thumbResult.onSuccess {
+                                    thumbnailPath = it
+                                    Log.d("MainViewModel", "Thumbnail downloaded: $it")
+                                }.onFailure { error ->
+                                    Log.e("MainViewModel", "Thumbnail download failed: ${error.message}", error)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            // Don't let thumbnail generation failures break downloads
+                            Log.e("MainViewModel", "Thumbnail generation failed", e)
+                        }
+
+                        // Create individual history entry for this media item
                         val downloadHistory = DownloadHistory(
                             tweetId = tweetData.tweetId,
                             tweetUrl = tweetData.tweetUrl,
@@ -171,51 +157,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             text = tweetData.text,
                             downloadDate = System.currentTimeMillis(),
                             thumbnailPath = thumbnailPath,
-                            mediaUrls = JsonUtils.listToJson(mediaUrls),
-                            mediaTypes = JsonUtils.listToJson(mediaTypes),
-                            localFilePaths = JsonUtils.listToJson(downloadedPaths)
+                            mediaUrl = media.url,
+                            mediaType = media.type.name,
+                            localFilePath = path,
+                            mediaIndex = index,
+                            totalMediaCount = totalMediaCount
                         )
-                        repository.insert(downloadHistory)
-                    }
-                } else {
-                    // Create new history entry for fresh download
-                    val downloadHistory = DownloadHistory(
-                        tweetId = tweetData.tweetId,
-                        tweetUrl = tweetData.tweetUrl,
-                        authorName = tweetData.authorName,
-                        authorUsername = tweetData.authorUsername,
-                        text = tweetData.text,
-                        downloadDate = System.currentTimeMillis(),
-                        thumbnailPath = thumbnailPath,
-                        mediaUrls = JsonUtils.listToJson(mediaUrls),
-                        mediaTypes = JsonUtils.listToJson(mediaTypes),
-                        localFilePaths = JsonUtils.listToJson(downloadedPaths)
-                    )
-                    val newId = repository.insert(downloadHistory)
-                    Log.d("MainViewModel", "Created new history entry ID: $newId")
-                    newId
-                }
 
-                // IMPORTANT: Set progress state BEFORE GIF generation to avoid race condition
-                // This ensures the progress bar shows immediately when the item is bound
-                val willGenerateGif = firstVideoPath != null && firstVideoTweetId != null
+                        val historyId = repository.insert(downloadHistory)
+                        createdHistoryIds.add(historyId)
+                        Log.d("MainViewModel", "Created history entry ID: $historyId for media $index")
+
+                        // Generate GIF asynchronously if this is a video and GIF generation is enabled
+                        if (videoPath != null) {
+                            val shouldGenerateGifs = preferencesManager.generateGifsForThumbnails.firstOrNull() ?: true
+                            if (shouldGenerateGifs) {
+                                Log.d("MainViewModel", "Launching async GIF generation for ID: $historyId")
+                                // Initialize progress state immediately
+                                val currentMap = _gifGenerationProgress.value ?: emptyMap()
+                                _gifGenerationProgress.value = currentMap + (historyId to GifGenerationProgress.InProgress(0))
+                                launchAsyncGifGeneration(historyId, videoPath, "${tweetData.tweetId}_$index")
+                            } else {
+                                Log.d("MainViewModel", "GIF generation disabled, keeping static thumbnail")
+                            }
+                        }
+                    }.onFailure { error ->
+                        Log.e("MainViewModel", "Download failed: ${error.message}", error)
+                        _errorMessage.postValue("Failed to download media ${index + 1}: ${error.message}")
+                    }
+                }
 
                 _loadingState.value = LoadingState.Success
                 _downloadProgress.value = 100
 
-                // Generate GIF asynchronously if we have a video and GIF generation is enabled
-                if (willGenerateGif) {
-                    val shouldGenerateGifs = preferencesManager.generateGifsForThumbnails.firstOrNull() ?: true
-                    if (shouldGenerateGifs) {
-                        Log.d("MainViewModel", "Launching async GIF generation for ID: $historyId")
-                        // Initialize progress state immediately (synchronously on main thread)
-                        val currentMap = _gifGenerationProgress.value ?: emptyMap()
-                        _gifGenerationProgress.value = currentMap + (historyId to GifGenerationProgress.InProgress(0))
-                        launchAsyncGifGeneration(historyId, firstVideoPath!!, firstVideoTweetId!!)
-                    } else {
-                        Log.d("MainViewModel", "GIF generation disabled, keeping static thumbnail")
-                    }
-                }
+                Log.d("MainViewModel", "Created ${createdHistoryIds.size} individual history entries")
 
             } catch (e: Exception) {
                 _errorMessage.value = e.message
@@ -225,51 +200,80 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Generates GIF thumbnail asynchronously and updates the history entry when complete
+     * Generates GIF thumbnail asynchronously using WorkManager for guaranteed background execution.
+     * This ensures GIF generation continues even when the app is in the background.
      */
     private fun launchAsyncGifGeneration(historyId: Long, videoPath: String, tweetId: String) {
-        viewModelScope.launch {
-            try {
-                Log.d("MainViewModel", "Starting async GIF generation for history ID: $historyId")
+        Log.d("MainViewModel", "Scheduling GIF generation work for history ID: $historyId")
 
-                // Update progress map to show generation starting
-                updateGifProgress(historyId, GifGenerationProgress.InProgress(0))
+        // Create input data for the worker
+        val inputData = Data.Builder()
+            .putLong(GifGenerationWorker.KEY_HISTORY_ID, historyId)
+            .putString(GifGenerationWorker.KEY_VIDEO_PATH, videoPath)
+            .putString(GifGenerationWorker.KEY_TWEET_ID, tweetId)
+            .build()
 
-                val gifResult = mediaDownloader.generateVideoGifThumbnail(
-                    videoPath,
-                    tweetId
-                ) { progress ->
-                    // Update progress as frames are extracted/encoded
-                    updateGifProgress(historyId, GifGenerationProgress.InProgress(progress))
-                }
+        // Create work request with constraints
+        val workRequest = OneTimeWorkRequestBuilder<GifGenerationWorker>()
+            .setInputData(inputData)
+            .addTag("gif_generation_$historyId")
+            .build()
 
-                gifResult.onSuccess { gifPath ->
-                    Log.d("MainViewModel", "GIF generated successfully: $gifPath")
+        // Store the work ID for this history entry
+        gifWorkIds[historyId] = workRequest.id
 
-                    // Update the history entry with the new GIF thumbnail
-                    val history = repository.getDownloadById(historyId)
-                    if (history != null) {
-                        val updatedHistory = history.copy(thumbnailPath = gifPath)
-                        repository.update(updatedHistory)
-                        Log.d("MainViewModel", "Updated history entry with GIF thumbnail")
+        // Enqueue the work
+        workManager.enqueue(workRequest)
 
-                        // Mark as complete and remove from progress map after short delay
-                        updateGifProgress(historyId, GifGenerationProgress.Complete)
-                        kotlinx.coroutines.delay(1000)
-                        removeGifProgress(historyId)
-                    } else {
-                        Log.w("MainViewModel", "Could not find history entry $historyId to update")
-                        updateGifProgress(historyId, GifGenerationProgress.Failed)
+        // Create and store observer for cleanup
+        val observer = androidx.lifecycle.Observer<WorkInfo> { workInfo ->
+            if (workInfo != null) {
+                when (workInfo.state) {
+                    WorkInfo.State.ENQUEUED,
+                    WorkInfo.State.RUNNING -> {
+                        // Extract progress from work data
+                        val progress = workInfo.progress.getInt(GifGenerationWorker.KEY_PROGRESS, 0)
+                        updateGifProgress(historyId, GifGenerationProgress.InProgress(progress))
+                        Log.d("MainViewModel", "GIF generation progress for $historyId: $progress%")
                     }
-                }.onFailure { error ->
-                    Log.w("MainViewModel", "Async GIF generation failed (static thumbnail will remain)", error)
-                    updateGifProgress(historyId, GifGenerationProgress.Failed)
+                    WorkInfo.State.SUCCEEDED -> {
+                        Log.d("MainViewModel", "GIF generation completed for history ID: $historyId")
+                        updateGifProgress(historyId, GifGenerationProgress.Complete)
+                        // Remove from progress map and cleanup after short delay
+                        viewModelScope.launch {
+                            kotlinx.coroutines.delay(1000)
+                            removeGifProgress(historyId)
+                            gifWorkIds.remove(historyId)
+                            // Remove observer
+                            workInfoObservers.remove(workRequest.id)?.let { obs ->
+                                workManager.getWorkInfoByIdLiveData(workRequest.id).removeObserver(obs)
+                            }
+                        }
+                    }
+                    WorkInfo.State.FAILED,
+                    WorkInfo.State.CANCELLED -> {
+                        val errorMessage = workInfo.outputData.getString(GifGenerationWorker.KEY_ERROR_MESSAGE)
+                        Log.w("MainViewModel", "GIF generation failed for history ID $historyId: $errorMessage")
+                        updateGifProgress(historyId, GifGenerationProgress.Failed)
+                        gifWorkIds.remove(historyId)
+                        // Remove observer
+                        workInfoObservers.remove(workRequest.id)?.let { obs ->
+                            workManager.getWorkInfoByIdLiveData(workRequest.id).removeObserver(obs)
+                        }
+                    }
+                    WorkInfo.State.BLOCKED -> {
+                        Log.d("MainViewModel", "GIF generation blocked for history ID: $historyId")
+                    }
                 }
-            } catch (e: Exception) {
-                Log.e("MainViewModel", "Error in async GIF generation", e)
-                updateGifProgress(historyId, GifGenerationProgress.Failed)
             }
         }
+
+        // Store observer and start observing
+        workInfoObservers[workRequest.id] = observer
+        workManager.getWorkInfoByIdLiveData(workRequest.id).observeForever(observer)
+
+        // Set initial progress immediately
+        updateGifProgress(historyId, GifGenerationProgress.InProgress(0))
     }
 
     private fun updateGifProgress(historyId: Long, progress: GifGenerationProgress) {
@@ -298,30 +302,96 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun redownloadMedia(downloadHistory: DownloadHistory) {
         viewModelScope.launch {
             try {
-                val mediaUrls = JsonUtils.jsonToList(downloadHistory.mediaUrls)
-                val mediaTypes = JsonUtils.jsonToList(downloadHistory.mediaTypes)
+                _loadingState.value = LoadingState.Loading
+                Log.d("MainViewModel", "Redownloading media for history ID: ${downloadHistory.id}")
 
-                val mediaItems = mediaUrls.mapIndexed { index, url ->
-                    MediaItem(
-                        url = url,
-                        type = MediaType.valueOf(mediaTypes[index]),
-                        thumbnailUrl = null
-                    )
-                }
-
-                val tweetData = TweetData(
-                    tweetId = downloadHistory.tweetId,
-                    tweetUrl = downloadHistory.tweetUrl,
-                    authorName = downloadHistory.authorName,
-                    authorUsername = downloadHistory.authorUsername,
-                    text = downloadHistory.text,
-                    mediaItems = mediaItems
+                // Create media item from the single entry
+                val mediaItem = MediaItem(
+                    url = downloadHistory.mediaUrl,
+                    type = MediaType.valueOf(downloadHistory.mediaType),
+                    thumbnailUrl = null
                 )
 
-                // Pass the existing history ID to update instead of creating new entry
-                downloadSelectedMedia(tweetData, mediaItems, existingHistoryId = downloadHistory.id)
+                // Download the media
+                val result = mediaDownloader.downloadMedia(
+                    mediaItem,
+                    downloadHistory.tweetId
+                ) { progress ->
+                    _downloadProgress.postValue(progress)
+                }
+
+                result.onSuccess { path ->
+                    Log.d("MainViewModel", "Redownloaded successfully: $path")
+
+                    // Generate new thumbnail
+                    var thumbnailPath: String? = null
+                    var videoPath: String? = null
+
+                    try {
+                        if (mediaItem.type == MediaType.VIDEO) {
+                            videoPath = path
+                            // Extract static thumbnail
+                            val thumbResult = mediaDownloader.extractStaticThumbnail(
+                                path,
+                                "${downloadHistory.tweetId}_${downloadHistory.mediaIndex}"
+                            )
+                            thumbResult.onSuccess {
+                                thumbnailPath = it
+                                Log.d("MainViewModel", "Static thumbnail extracted: $it")
+                            }.onFailure { error ->
+                                Log.e("MainViewModel", "Static thumbnail extraction failed: ${error.message}", error)
+                            }
+                        } else {
+                            // For images and GIFs, download thumbnail
+                            val thumbUrl = mediaItem.thumbnailUrl ?: mediaItem.url
+                            val thumbResult = mediaDownloader.downloadThumbnail(
+                                thumbUrl,
+                                "${downloadHistory.tweetId}_${downloadHistory.mediaIndex}"
+                            )
+                            thumbResult.onSuccess {
+                                thumbnailPath = it
+                                Log.d("MainViewModel", "Thumbnail downloaded: $it")
+                            }.onFailure { error ->
+                                Log.e("MainViewModel", "Thumbnail download failed: ${error.message}", error)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e("MainViewModel", "Thumbnail generation failed", e)
+                    }
+
+                    // Update the existing history entry
+                    val updatedHistory = downloadHistory.copy(
+                        downloadDate = System.currentTimeMillis(),
+                        thumbnailPath = thumbnailPath,
+                        localFilePath = path
+                    )
+                    repository.update(updatedHistory)
+                    Log.d("MainViewModel", "Updated history entry ID: ${downloadHistory.id}")
+
+                    // Generate GIF if this is a video
+                    if (videoPath != null) {
+                        val shouldGenerateGifs = preferencesManager.generateGifsForThumbnails.firstOrNull() ?: true
+                        if (shouldGenerateGifs) {
+                            val currentMap = _gifGenerationProgress.value ?: emptyMap()
+                            _gifGenerationProgress.value = currentMap + (downloadHistory.id to GifGenerationProgress.InProgress(0))
+                            launchAsyncGifGeneration(
+                                downloadHistory.id,
+                                videoPath,
+                                "${downloadHistory.tweetId}_${downloadHistory.mediaIndex}"
+                            )
+                        }
+                    }
+
+                    _loadingState.value = LoadingState.Success
+                    _downloadProgress.value = 100
+                }.onFailure { error ->
+                    Log.e("MainViewModel", "Redownload failed: ${error.message}", error)
+                    _errorMessage.value = "Redownload failed: ${error.message}"
+                    _loadingState.value = LoadingState.Error(error.message ?: "Redownload failed")
+                }
             } catch (e: Exception) {
                 _errorMessage.value = "Redownload failed: ${e.message}"
+                _loadingState.value = LoadingState.Error(e.message ?: "Redownload failed")
             }
         }
     }
@@ -372,25 +442,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-            // Delete downloaded media files
-            val localPaths = JsonUtils.jsonToList(downloadHistory.localFilePaths)
-            localPaths.forEach { path ->
-                if (path.startsWith("content://")) {
-                    // For content URIs, try to delete from MediaStore
-                    try {
-                        val uri = android.net.Uri.parse(path)
-                        val deleted = getApplication<Application>().contentResolver.delete(uri, null, null)
-                        Log.d("MainViewModel", "Deleted media from MediaStore: $deleted ($path)")
-                    } catch (e: Exception) {
-                        Log.e("MainViewModel", "Failed to delete from MediaStore: $path", e)
-                    }
-                } else {
-                    // For file paths, delete directly
-                    val file = java.io.File(path)
-                    if (file.exists()) {
-                        val deleted = file.delete()
-                        Log.d("MainViewModel", "Deleted media file: $deleted ($path)")
-                    }
+            // Delete downloaded media file
+            val path = downloadHistory.localFilePath
+            if (path.startsWith("content://")) {
+                // For content URIs, try to delete from MediaStore
+                try {
+                    val uri = android.net.Uri.parse(path)
+                    val deleted = getApplication<Application>().contentResolver.delete(uri, null, null)
+                    Log.d("MainViewModel", "Deleted media from MediaStore: $deleted ($path)")
+                } catch (e: Exception) {
+                    Log.e("MainViewModel", "Failed to delete from MediaStore: $path", e)
+                }
+            } else {
+                // For file paths, delete directly
+                val file = java.io.File(path)
+                if (file.exists()) {
+                    val deleted = file.delete()
+                    Log.d("MainViewModel", "Deleted media file: $deleted ($path)")
                 }
             }
         } catch (e: Exception) {
@@ -419,8 +487,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // Collect all video items that need GIF generation and set initial progress
         if (shouldGenerateGifs) {
             val videoItems = downloads.filter { history ->
-                val mediaTypes = JsonUtils.jsonToList(history.mediaTypes)
-                mediaTypes.isNotEmpty() && mediaTypes[0] == "VIDEO"
+                history.mediaType == "VIDEO"
             }
 
             if (videoItems.isNotEmpty()) {
@@ -437,74 +504,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         downloads.forEach { history ->
             try {
-                // Get the first media item
-                val mediaTypes = JsonUtils.jsonToList(history.mediaTypes)
-                val localPaths = JsonUtils.jsonToList(history.localFilePaths)
-
-                if (mediaTypes.isEmpty() || localPaths.isEmpty()) {
-                    Log.w("MainViewModel", "Skipping history ${history.id}: no media")
-                    return@forEach
-                }
-
-                val firstMediaType = mediaTypes[0]
-                val firstLocalPath = localPaths[0]
-
                 // Only refresh thumbnails for videos
-                if (firstMediaType == "VIDEO") {
+                if (history.mediaType == "VIDEO") {
                     Log.d("MainViewModel", "Refreshing thumbnail for history ${history.id}")
 
                     val oldThumbnailPath = history.thumbnailPath
 
                     if (shouldGenerateGifs) {
-                        // Generate GIF thumbnail asynchronously with progress tracking
+                        // Generate GIF thumbnail asynchronously using WorkManager
                         // (progress state already initialized above)
                         Log.d("MainViewModel", "Starting async GIF refresh for history ${history.id}")
 
-                        // Launch async generation (don't wait - process next item)
-                        viewModelScope.launch {
-                            try {
-                                val gifResult = mediaDownloader.generateVideoGifThumbnail(
-                                    firstLocalPath,
-                                    history.tweetId
-                                ) { progress ->
-                                    updateGifProgress(history.id, GifGenerationProgress.InProgress(progress))
-                                }
-
-                                gifResult.onSuccess { newThumbnailPath ->
-                                    Log.d("MainViewModel", "GIF refresh complete for history ${history.id}")
-
-                                    // Delete old thumbnail AFTER new one is generated
-                                    oldThumbnailPath?.let { oldPath ->
-                                        val oldFile = java.io.File(oldPath)
-                                        if (oldFile.exists() && oldPath != newThumbnailPath) {
-                                            oldFile.delete()
-                                            Log.d("MainViewModel", "Deleted old thumbnail: $oldPath")
-                                        }
+                        // Delete old thumbnail after new one is generated (handled by worker)
+                        // Note: Old thumbnail cleanup is now handled separately since WorkManager completes asynchronously
+                        oldThumbnailPath?.let { oldPath ->
+                            viewModelScope.launch {
+                                // Wait a bit to ensure new thumbnail is generated, then clean up old one
+                                kotlinx.coroutines.delay(2000)
+                                val oldFile = java.io.File(oldPath)
+                                if (oldFile.exists()) {
+                                    // Check if it's still the current thumbnail (user might have changed it)
+                                    val currentHistory = repository.getDownloadById(history.id)
+                                    if (currentHistory?.thumbnailPath != oldPath) {
+                                        oldFile.delete()
+                                        Log.d("MainViewModel", "Deleted old thumbnail: $oldPath")
                                     }
-
-                                    // Update history with new thumbnail
-                                    val updatedHistory = history.copy(thumbnailPath = newThumbnailPath)
-                                    repository.update(updatedHistory)
-                                    Log.d("MainViewModel", "Updated thumbnail for history ${history.id}: $newThumbnailPath")
-
-                                    // Mark as complete and remove from progress map after short delay
-                                    updateGifProgress(history.id, GifGenerationProgress.Complete)
-                                    kotlinx.coroutines.delay(1000)
-                                    removeGifProgress(history.id)
-                                }.onFailure { error ->
-                                    Log.e("MainViewModel", "GIF refresh failed for history ${history.id}", error)
-                                    updateGifProgress(history.id, GifGenerationProgress.Failed)
                                 }
-                            } catch (e: Exception) {
-                                Log.e("MainViewModel", "Error in async GIF refresh for history ${history.id}", e)
-                                updateGifProgress(history.id, GifGenerationProgress.Failed)
                             }
                         }
+
+                        // Use WorkManager for guaranteed background execution
+                        launchAsyncGifGeneration(history.id, history.localFilePath, "${history.tweetId}_${history.mediaIndex}")
                     } else {
                         // Generate static thumbnail synchronously (it's fast)
                         val staticResult = mediaDownloader.extractStaticThumbnail(
-                            firstLocalPath,
-                            history.tweetId
+                            history.localFilePath,
+                            "${history.tweetId}_${history.mediaIndex}"
                         )
 
                         staticResult.onSuccess { newThumbnailPath ->
@@ -546,9 +581,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 put("text", history.text)
                 put("downloadDate", history.downloadDate)
                 put("thumbnailPath", history.thumbnailPath ?: "")
-                put("mediaUrls", history.mediaUrls)
-                put("mediaTypes", history.mediaTypes)
-                put("localFilePaths", history.localFilePaths)
+                put("mediaUrl", history.mediaUrl)
+                put("mediaType", history.mediaType)
+                put("localFilePath", history.localFilePath)
+                put("mediaIndex", history.mediaIndex)
+                put("totalMediaCount", history.totalMediaCount)
             }
             backupJson.put(entryJson)
         }
@@ -574,37 +611,102 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         for (i in 0 until backupJson.length()) {
             val entryJson = backupJson.getJSONObject(i)
 
-            // Check if entry already exists by tweetId
-            val existingEntry = repository.getDownloadByTweetId(entryJson.getString("tweetId"))
-            if (existingEntry != null) {
-                Log.d("MainViewModel", "Skipping duplicate entry: ${entryJson.getString("tweetId")}")
-                continue
-            }
+            // Detect format: check if new format fields exist
+            val isNewFormat = entryJson.has("mediaUrl")
 
-            val history = DownloadHistory(
-                tweetId = entryJson.getString("tweetId"),
-                tweetUrl = entryJson.getString("tweetUrl"),
-                authorName = entryJson.getString("authorName"),
-                authorUsername = entryJson.getString("authorUsername"),
-                text = entryJson.getString("text"),
-                downloadDate = entryJson.getLong("downloadDate"),
-                thumbnailPath = entryJson.getString("thumbnailPath").ifEmpty { null },
-                mediaUrls = entryJson.getString("mediaUrls"),
-                mediaTypes = entryJson.getString("mediaTypes"),
-                localFilePaths = entryJson.getString("localFilePaths")
-            )
+            if (isNewFormat) {
+                // New format: single media per entry
+                val tweetId = entryJson.getString("tweetId")
+                val mediaIndex = entryJson.optInt("mediaIndex", 0)
 
-            // Insert into database
-            val historyId = repository.insert(history)
-            restoredCount++
+                // Check if entry already exists by tweetId AND mediaIndex
+                // (with new format, multiple entries can have same tweetId but different mediaIndex)
+                val allDownloads = repository.allDownloads.firstOrNull() ?: emptyList()
+                val existingEntry = allDownloads.find {
+                    it.tweetId == tweetId && it.mediaIndex == mediaIndex
+                }
 
-            // Check if thumbnail is missing or invalid
-            val needsNewThumbnail = history.thumbnailPath == null ||
-                    !java.io.File(history.thumbnailPath).exists()
+                if (existingEntry != null) {
+                    Log.d("MainViewModel", "Skipping duplicate entry: $tweetId (index $mediaIndex)")
+                    continue
+                }
 
-            if (needsNewThumbnail) {
-                Log.d("MainViewModel", "Generating missing thumbnail for restored entry ${history.tweetId}")
-                generateMissingThumbnail(historyId, history, shouldGenerateGifs)
+                val history = DownloadHistory(
+                    tweetId = tweetId,
+                    tweetUrl = entryJson.getString("tweetUrl"),
+                    authorName = entryJson.getString("authorName"),
+                    authorUsername = entryJson.getString("authorUsername"),
+                    text = entryJson.getString("text"),
+                    downloadDate = entryJson.getLong("downloadDate"),
+                    thumbnailPath = entryJson.getString("thumbnailPath").ifEmpty { null },
+                    mediaUrl = entryJson.getString("mediaUrl"),
+                    mediaType = entryJson.getString("mediaType"),
+                    localFilePath = entryJson.getString("localFilePath"),
+                    mediaIndex = mediaIndex,
+                    totalMediaCount = entryJson.optInt("totalMediaCount", 1)
+                )
+
+                // Insert into database
+                val historyId = repository.insert(history)
+                restoredCount++
+
+                // Check if thumbnail is missing or invalid
+                val needsNewThumbnail = history.thumbnailPath == null ||
+                        !java.io.File(history.thumbnailPath).exists()
+
+                if (needsNewThumbnail) {
+                    Log.d("MainViewModel", "Generating missing thumbnail for restored entry $tweetId (index $mediaIndex)")
+                    generateMissingThumbnail(historyId, history, shouldGenerateGifs)
+                }
+            } else {
+                // Old format: multiple media in JSON arrays - convert to individual entries
+                val tweetId = entryJson.getString("tweetId")
+                val existingEntry = repository.getDownloadByTweetId(tweetId)
+                if (existingEntry != null) {
+                    Log.d("MainViewModel", "Skipping duplicate tweet: $tweetId")
+                    continue
+                }
+
+                try {
+                    val mediaUrls = JsonUtils.jsonToList(entryJson.getString("mediaUrls"))
+                    val mediaTypes = JsonUtils.jsonToList(entryJson.getString("mediaTypes"))
+                    val localPaths = JsonUtils.jsonToList(entryJson.getString("localFilePaths"))
+                    val totalMediaCount = mediaUrls.size
+
+                    // Create individual entry for each media item
+                    mediaUrls.forEachIndexed { index, mediaUrl ->
+                        if (index < mediaTypes.size && index < localPaths.size) {
+                            val history = DownloadHistory(
+                                tweetId = tweetId,
+                                tweetUrl = entryJson.getString("tweetUrl"),
+                                authorName = entryJson.getString("authorName"),
+                                authorUsername = entryJson.getString("authorUsername"),
+                                text = entryJson.getString("text"),
+                                downloadDate = entryJson.getLong("downloadDate"),
+                                thumbnailPath = if (index == 0) entryJson.getString("thumbnailPath").ifEmpty { null } else null,
+                                mediaUrl = mediaUrl,
+                                mediaType = mediaTypes[index],
+                                localFilePath = localPaths[index],
+                                mediaIndex = index,
+                                totalMediaCount = totalMediaCount
+                            )
+
+                            val historyId = repository.insert(history)
+                            restoredCount++
+
+                            // Generate thumbnail if missing (only for first media or if thumbnail is null)
+                            val needsNewThumbnail = history.thumbnailPath == null ||
+                                    !java.io.File(history.thumbnailPath ?: "").exists()
+
+                            if (needsNewThumbnail) {
+                                Log.d("MainViewModel", "Generating missing thumbnail for restored entry $tweetId (index $index)")
+                                generateMissingThumbnail(historyId, history, shouldGenerateGifs)
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("MainViewModel", "Failed to parse old format entry: $tweetId", e)
+                }
             }
         }
 
@@ -615,63 +717,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun generateMissingThumbnail(historyId: Long, history: DownloadHistory, shouldGenerateGifs: Boolean) {
         viewModelScope.launch {
             try {
-                val mediaTypes = JsonUtils.jsonToList(history.mediaTypes)
-                val localPaths = JsonUtils.jsonToList(history.localFilePaths)
-
-                if (mediaTypes.isEmpty() || localPaths.isEmpty()) {
-                    Log.w("MainViewModel", "No media for history $historyId, skipping thumbnail generation")
-                    return@launch
-                }
-
-                val firstMediaType = mediaTypes[0]
-                val firstLocalPath = localPaths[0]
-
                 // Check if local file exists
-                val fileExists = if (firstLocalPath.startsWith("content://")) {
+                val localPath = history.localFilePath
+                val fileExists = if (localPath.startsWith("content://")) {
                     try {
-                        getApplication<Application>().contentResolver.openInputStream(Uri.parse(firstLocalPath))?.use { true } ?: false
+                        getApplication<Application>().contentResolver.openInputStream(Uri.parse(localPath))?.use { true } ?: false
                     } catch (e: Exception) {
                         false
                     }
                 } else {
-                    java.io.File(firstLocalPath).exists()
+                    java.io.File(localPath).exists()
                 }
 
                 if (!fileExists) {
-                    Log.w("MainViewModel", "Local file not found for history $historyId: $firstLocalPath")
+                    Log.w("MainViewModel", "Local file not found for history $historyId: $localPath")
                     return@launch
                 }
 
                 // Generate thumbnail based on media type
-                if (firstMediaType == "VIDEO") {
+                if (history.mediaType == "VIDEO") {
                     if (shouldGenerateGifs) {
-                        // Generate GIF asynchronously with progress
-                        updateGifProgress(historyId, GifGenerationProgress.InProgress(0))
-
-                        val gifResult = mediaDownloader.generateVideoGifThumbnail(
-                            firstLocalPath,
-                            history.tweetId
-                        ) { progress ->
-                            updateGifProgress(historyId, GifGenerationProgress.InProgress(progress))
-                        }
-
-                        gifResult.onSuccess { thumbnailPath ->
-                            val updatedHistory = history.copy(thumbnailPath = thumbnailPath, id = historyId)
-                            repository.update(updatedHistory)
-                            Log.d("MainViewModel", "Generated GIF thumbnail for restored entry: $thumbnailPath")
-
-                            updateGifProgress(historyId, GifGenerationProgress.Complete)
-                            kotlinx.coroutines.delay(1000)
-                            removeGifProgress(historyId)
-                        }.onFailure { error ->
-                            Log.e("MainViewModel", "Failed to generate GIF for restored entry", error)
-                            updateGifProgress(historyId, GifGenerationProgress.Failed)
-                        }
+                        // Generate GIF asynchronously using WorkManager for guaranteed background execution
+                        Log.d("MainViewModel", "Launching WorkManager GIF generation for restored entry $historyId")
+                        launchAsyncGifGeneration(historyId, localPath, "${history.tweetId}_${history.mediaIndex}")
                     } else {
                         // Generate static thumbnail
                         val staticResult = mediaDownloader.extractStaticThumbnail(
-                            firstLocalPath,
-                            history.tweetId
+                            localPath,
+                            "${history.tweetId}_${history.mediaIndex}"
                         )
 
                         staticResult.onSuccess { thumbnailPath ->
@@ -684,9 +757,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 } else {
                     // For images/GIFs, download thumbnail from URL if we have it
-                    val mediaUrls = JsonUtils.jsonToList(history.mediaUrls)
-                    if (mediaUrls.isNotEmpty()) {
-                        val thumbnailResult = mediaDownloader.downloadThumbnail(mediaUrls[0], history.tweetId)
+                    if (history.mediaUrl.isNotEmpty()) {
+                        val thumbnailResult = mediaDownloader.downloadThumbnail(
+                            history.mediaUrl,
+                            "${history.tweetId}_${history.mediaIndex}"
+                        )
                         thumbnailResult.onSuccess { thumbnailPath ->
                             val updatedHistory = history.copy(thumbnailPath = thumbnailPath, id = historyId)
                             repository.update(updatedHistory)
@@ -702,6 +777,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearError() {
         _errorMessage.value = null
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        // Clean up all WorkManager observers to prevent memory leaks
+        workInfoObservers.forEach { (workId, observer) ->
+            workManager.getWorkInfoByIdLiveData(workId).removeObserver(observer)
+        }
+        workInfoObservers.clear()
+        gifWorkIds.clear()
+        Log.d("MainViewModel", "Cleaned up WorkManager observers")
     }
 }
 

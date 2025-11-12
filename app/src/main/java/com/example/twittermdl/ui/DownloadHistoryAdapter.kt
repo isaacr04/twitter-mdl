@@ -121,7 +121,7 @@ class DownloadHistoryAdapter(
                     false  // If we can't check, assume files don't exist
                 }
 
-                Log.d("HistoryAdapter", "History ${history.id}: mediaExists=$mediaExists, localFilePaths=${history.localFilePaths}")
+                Log.d("HistoryAdapter", "History ${history.id}: mediaExists=$mediaExists, localFilePath=${history.localFilePath}")
 
                 // Always set button visibility - ensure one is visible and one is gone
                 if (mediaExists) {
@@ -159,93 +159,78 @@ class DownloadHistoryAdapter(
         }
 
         private fun checkMediaFilesExist(history: DownloadHistory): Boolean {
-            // Handle null or empty localFilePaths
-            val localFilePathsJson = history.localFilePaths
-            if (localFilePathsJson.isNullOrBlank() || localFilePathsJson == "[]") {
-                Log.d("HistoryAdapter", "No local paths in JSON for history ${history.id}: '$localFilePathsJson'")
+            // Handle null or empty localFilePath
+            val localPath = history.localFilePath
+            if (localPath.isBlank()) {
+                Log.d("HistoryAdapter", "No local path for history ${history.id}")
                 return false
             }
 
-            val localPaths = try {
-                JsonUtils.jsonToList(localFilePathsJson)
-            } catch (e: Exception) {
-                Log.e("HistoryAdapter", "Error parsing localFilePaths JSON for history ${history.id}: ${e.message}")
-                return false
-            }
+            Log.d("HistoryAdapter", "Checking file for history ${history.id}: $localPath")
 
-            Log.d("HistoryAdapter", "Checking files for history ${history.id}: ${localPaths.size} paths from JSON: $localFilePathsJson")
+            // Check if the media file exists
+            val exists = if (localPath.startsWith("content://")) {
+                // For content URIs, query MediaStore to verify the file exists and is not trashed
+                try {
+                    val uri = Uri.parse(localPath)
+                    var fileExists = false
 
-            if (localPaths.isEmpty()) {
-                Log.d("HistoryAdapter", "Empty paths list for history ${history.id}")
-                return false
-            }
+                    // Build projection - include IS_TRASHED for Android 10+ (API 29+)
+                    val projection = mutableListOf(
+                        android.provider.MediaStore.MediaColumns._ID,
+                        android.provider.MediaStore.MediaColumns.SIZE,
+                        android.provider.MediaStore.MediaColumns.DATA
+                    )
 
-            // Check if at least one media file exists
-            val result = localPaths.any { path ->
-                val exists = if (path.startsWith("content://")) {
-                    // For content URIs, query MediaStore to verify the file exists and is not trashed
-                    try {
-                        val uri = Uri.parse(path)
-                        var fileExists = false
-
-                        // Build projection - include IS_TRASHED for Android 10+ (API 29+)
-                        val projection = mutableListOf(
-                            android.provider.MediaStore.MediaColumns._ID,
-                            android.provider.MediaStore.MediaColumns.SIZE,
-                            android.provider.MediaStore.MediaColumns.DATA
-                        )
-
-                        // Add IS_TRASHED column for Android 10+ to detect trashed files
-                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                            projection.add(android.provider.MediaStore.MediaColumns.IS_TRASHED)
-                        }
-
-                        // Query the MediaStore to check if the file exists and has valid data
-                        itemView.context.contentResolver.query(
-                            uri,
-                            projection.toTypedArray(),
-                            null,
-                            null,
-                            null
-                        )?.use { cursor ->
-                            if (cursor.moveToFirst()) {
-                                val sizeIndex = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.SIZE)
-                                val size = if (sizeIndex >= 0) cursor.getLong(sizeIndex) else 0
-
-                                // Check if file is trashed (Android 10+)
-                                val isTrashed = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                                    val trashedIndex = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.IS_TRASHED)
-                                    if (trashedIndex >= 0) cursor.getInt(trashedIndex) == 1 else false
-                                } else {
-                                    false
-                                }
-
-                                // File exists if we got a result, size > 0, and NOT trashed
-                                fileExists = size > 0 && !isTrashed
-                                Log.d("HistoryAdapter", "Content URI $path: exists=$fileExists, size=$size bytes, trashed=$isTrashed")
-                            } else {
-                                Log.d("HistoryAdapter", "Content URI $path: cursor empty (file deleted)")
-                            }
-                        } ?: run {
-                            Log.d("HistoryAdapter", "Content URI $path: query returned null")
-                        }
-
-                        fileExists
-                    } catch (e: Exception) {
-                        Log.d("HistoryAdapter", "Content URI $path: query error=${e.message}")
-                        false
+                    // Add IS_TRASHED column for Android 10+ to detect trashed files
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                        projection.add(android.provider.MediaStore.MediaColumns.IS_TRASHED)
                     }
-                } else {
-                    // For file paths, check if file exists
-                    val fileExists = File(path).exists()
-                    Log.d("HistoryAdapter", "File path $path: exists=$fileExists")
+
+                    // Query the MediaStore to check if the file exists and has valid data
+                    itemView.context.contentResolver.query(
+                        uri,
+                        projection.toTypedArray(),
+                        null,
+                        null,
+                        null
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val sizeIndex = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.SIZE)
+                            val size = if (sizeIndex >= 0) cursor.getLong(sizeIndex) else 0
+
+                            // Check if file is trashed (Android 10+)
+                            val isTrashed = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                                val trashedIndex = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.IS_TRASHED)
+                                if (trashedIndex >= 0) cursor.getInt(trashedIndex) == 1 else false
+                            } else {
+                                false
+                            }
+
+                            // File exists if we got a result, size > 0, and NOT trashed
+                            fileExists = size > 0 && !isTrashed
+                            Log.d("HistoryAdapter", "Content URI $localPath: exists=$fileExists, size=$size bytes, trashed=$isTrashed")
+                        } else {
+                            Log.d("HistoryAdapter", "Content URI $localPath: cursor empty (file deleted)")
+                        }
+                    } ?: run {
+                        Log.d("HistoryAdapter", "Content URI $localPath: query returned null")
+                    }
+
                     fileExists
+                } catch (e: Exception) {
+                    Log.d("HistoryAdapter", "Content URI $localPath: query error=${e.message}")
+                    false
                 }
-                exists
+            } else {
+                // For file paths, check if file exists
+                val fileExists = File(localPath).exists()
+                Log.d("HistoryAdapter", "File path $localPath: exists=$fileExists")
+                fileExists
             }
 
-            Log.d("HistoryAdapter", "Final result for history ${history.id}: mediaExists=$result")
-            return result
+            Log.d("HistoryAdapter", "Final result for history ${history.id}: mediaExists=$exists")
+            return exists
         }
 
         /**
@@ -321,26 +306,23 @@ class DownloadHistoryAdapter(
                     Log.d("HistoryAdapter", "No thumbnailPath for history ID ${history.id}, will try fallback")
                 }
 
-                // Fallback: Parse media types and local file paths
-                val mediaTypes = JsonUtils.jsonToList(history.mediaTypes)
-                val localPaths = JsonUtils.jsonToList(history.localFilePaths)
+                // Fallback: Use media type and local file path directly
+                val mediaType = history.mediaType
+                val localPath = history.localFilePath
 
-                Log.d("HistoryAdapter", "Fallback: mediaTypes=${mediaTypes.size}, localPaths=${localPaths.size}")
+                Log.d("HistoryAdapter", "Fallback: mediaType=$mediaType, localPath=$localPath")
 
-                if (mediaTypes.isNotEmpty() && localPaths.isNotEmpty()) {
-                    val firstMediaType = mediaTypes[0]
-                    val firstLocalPath = localPaths[0]
-
-                    Log.d("HistoryAdapter", "Loading fallback for type: $firstMediaType, path: $firstLocalPath")
+                if (mediaType.isNotBlank() && localPath.isNotBlank()) {
+                    Log.d("HistoryAdapter", "Loading fallback for type: $mediaType, path: $localPath")
 
                     // Handle both file paths and content URIs
-                    val imageSource = if (firstLocalPath.startsWith("content://")) {
-                        Uri.parse(firstLocalPath)
+                    val imageSource = if (localPath.startsWith("content://")) {
+                        Uri.parse(localPath)
                     } else {
-                        File(firstLocalPath)
+                        File(localPath)
                     }
 
-                    when (firstMediaType) {
+                    when (mediaType) {
                         "GIF" -> {
                             // Load GIF with animation - use software rendering for compatibility
                             Log.d("HistoryAdapter", "Loading GIF from media file")
@@ -358,7 +340,7 @@ class DownloadHistoryAdapter(
                         }
                         "VIDEO" -> {
                             // For videos without GIF thumbnail, extract frame from video file
-                            Log.d("HistoryAdapter", "Extracting video frame from: $firstLocalPath")
+                            Log.d("HistoryAdapter", "Extracting video frame from: $localPath")
                             thumbnail.load(imageSource) {
                                 crossfade(true)
                                 videoFrameMillis(0)  // Extract frame from start instead of 15s (more reliable)

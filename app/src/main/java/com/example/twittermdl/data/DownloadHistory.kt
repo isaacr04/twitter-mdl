@@ -14,7 +14,9 @@ data class DownloadHistory(
     val text: String,
     val downloadDate: Long,
     val thumbnailPath: String?,
-    val mediaUrls: String, // JSON array of URLs
-    val mediaTypes: String, // JSON array of types
-    val localFilePaths: String // JSON array of local paths
+    val mediaUrl: String, // Single media URL
+    val mediaType: String, // Single media type
+    val localFilePath: String, // Single local file path
+    val mediaIndex: Int = 0, // Index of this media in the tweet (0-based)
+    val totalMediaCount: Int = 1 // Total number of media items in the tweet
 )

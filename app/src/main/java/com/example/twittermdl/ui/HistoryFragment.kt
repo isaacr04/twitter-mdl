@@ -173,17 +173,16 @@ class HistoryFragment : Fragment() {
     }
 
     private fun openMediaFiles(history: com.example.twittermdl.data.DownloadHistory) {
-        val localPaths = com.example.twittermdl.utils.JsonUtils.jsonToList(history.localFilePaths)
-        val mediaTypes = com.example.twittermdl.utils.JsonUtils.jsonToList(history.mediaTypes)
+        val localPath = history.localFilePath
+        val mediaType = history.mediaType
 
-        if (localPaths.isEmpty()) {
-            Toast.makeText(requireContext(), "No media files found", Toast.LENGTH_SHORT).show()
+        if (localPath.isBlank()) {
+            Toast.makeText(requireContext(), "No media file found", Toast.LENGTH_SHORT).show()
             return
         }
 
-        // Open the first media file
-        val firstPath = localPaths[0]
-        val mimeType = when (mediaTypes.getOrNull(0)) {
+        // Open the media file
+        val mimeType = when (mediaType) {
             "VIDEO" -> "video/*"
             "GIF" -> "image/gif"
             "IMAGE" -> "image/*"
@@ -192,10 +191,10 @@ class HistoryFragment : Fragment() {
         }
 
         try {
-            val uri = if (firstPath.startsWith("content://")) {
-                Uri.parse(firstPath)
+            val uri = if (localPath.startsWith("content://")) {
+                Uri.parse(localPath)
             } else {
-                Uri.parse("file://$firstPath")
+                Uri.parse("file://$localPath")
             }
 
             val intent = Intent(Intent.ACTION_VIEW).apply {

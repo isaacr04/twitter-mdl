@@ -22,7 +22,6 @@ A simple Android application for downloading images, GIFs, audio, and video cont
 
 ### Authentication
 - TBD
-- 
 
 ## Permissions
 

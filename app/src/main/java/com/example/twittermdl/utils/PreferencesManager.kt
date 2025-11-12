@@ -18,6 +18,10 @@ class PreferencesManager(private val context: Context) {
         private val AUTH_TOKEN_KEY = stringPreferencesKey("auth_token")
         private val CT0_KEY = stringPreferencesKey("ct0")
         private val IS_LOGGED_IN_KEY = booleanPreferencesKey("is_logged_in")
+
+        // Thumbnail settings
+        private val GENERATE_GIFS_KEY = booleanPreferencesKey("generate_gifs_for_thumbnails")
+        private val DELETE_LOCAL_FILES_KEY = booleanPreferencesKey("delete_local_files_with_history")
     }
 
     val userCredentials: Flow<UserCredentials?> = context.dataStore.data.map { preferences ->
@@ -35,6 +39,14 @@ class PreferencesManager(private val context: Context) {
 
     val isLoggedIn: Flow<Boolean> = context.dataStore.data.map { preferences ->
         preferences[IS_LOGGED_IN_KEY] ?: false
+    }
+
+    val generateGifsForThumbnails: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[GENERATE_GIFS_KEY] ?: true  // Default: enabled
+    }
+
+    val deleteLocalFilesWithHistory: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[DELETE_LOCAL_FILES_KEY] ?: false  // Default: disabled
     }
 
     suspend fun saveCredentials(credentials: UserCredentials) {
@@ -61,6 +73,18 @@ class PreferencesManager(private val context: Context) {
         context.dataStore.edit { preferences ->
             preferences[AUTH_TOKEN_KEY] = authToken
             preferences[CT0_KEY] = ct0
+        }
+    }
+
+    suspend fun setGenerateGifsForThumbnails(enabled: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[GENERATE_GIFS_KEY] = enabled
+        }
+    }
+
+    suspend fun setDeleteLocalFilesWithHistory(enabled: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[DELETE_LOCAL_FILES_KEY] = enabled
         }
     }
 }

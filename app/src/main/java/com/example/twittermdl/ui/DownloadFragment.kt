@@ -21,6 +21,7 @@ class DownloadFragment : Fragment() {
 
     private val viewModel: MainViewModel by activityViewModels()
     private lateinit var mediaAdapter: MediaAdapter
+    private var downloadInProgress = false
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -54,8 +55,8 @@ class DownloadFragment : Fragment() {
             if (clipData != null && clipData.itemCount > 0) {
                 val text = clipData.getItemAt(0).text?.toString() ?: return
 
-                // Check if it's a Twitter/X URL and the input field is empty
-                if (isTwitterUrl(text) && binding.urlInput.text.isNullOrEmpty()) {
+                // Check if it's a Twitter/X URL and auto-populate (always replace existing text)
+                if (isTwitterUrl(text)) {
                     binding.urlInput.setText(text)
                     Toast.makeText(
                         requireContext(),
@@ -98,7 +99,20 @@ class DownloadFragment : Fragment() {
             if (tweetData != null) {
                 val selectedMedia = mediaAdapter.getSelectedMedia()
                 if (selectedMedia.isNotEmpty()) {
-                    viewModel.downloadSelectedMedia(tweetData, selectedMedia)
+                    // Check if any selected media is a video with quality variants
+                    val videoWithVariants = selectedMedia.find {
+                        it.type == com.example.twittermdl.data.MediaType.VIDEO &&
+                        !it.videoVariants.isNullOrEmpty()
+                    }
+
+                    if (videoWithVariants != null && !videoWithVariants.videoVariants.isNullOrEmpty()) {
+                        // Show quality selection dialog
+                        showQualitySelectionDialog(tweetData, selectedMedia, videoWithVariants)
+                    } else {
+                        // No quality options available, download directly
+                        downloadInProgress = true
+                        viewModel.downloadSelectedMedia(tweetData, selectedMedia)
+                    }
                 } else {
                     Toast.makeText(
                         requireContext(),
@@ -108,6 +122,28 @@ class DownloadFragment : Fragment() {
                 }
             }
         }
+    }
+
+    private fun showQualitySelectionDialog(
+        tweetData: com.example.twittermdl.data.TweetData,
+        selectedMedia: List<com.example.twittermdl.data.MediaItem>,
+        videoItem: com.example.twittermdl.data.MediaItem
+    ) {
+        val dialog = VideoQualityDialog.newInstance(videoItem.videoVariants!!) { selectedVariant ->
+            // Replace the video item's URL with the selected variant's URL
+            val updatedMedia = selectedMedia.map { media ->
+                if (media == videoItem) {
+                    media.copy(url = selectedVariant.url)
+                } else {
+                    media
+                }
+            }
+
+            downloadInProgress = true
+            viewModel.downloadSelectedMedia(tweetData, updatedMedia)
+        }
+
+        dialog.show(childFragmentManager, "VideoQualityDialog")
     }
 
     private fun observeViewModel() {
@@ -143,13 +179,22 @@ class DownloadFragment : Fragment() {
                     binding.progressBar.visibility = View.GONE
                     binding.statusText.visibility = View.GONE
                     binding.fetchButton.isEnabled = true
-                    Toast.makeText(requireContext(), "Success!", Toast.LENGTH_SHORT).show()
+
+                    // Clear URL field after successful download
+                    if (downloadInProgress) {
+                        binding.urlInput.text?.clear()
+                        downloadInProgress = false
+                        Toast.makeText(requireContext(), "Download complete!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(requireContext(), "Success!", Toast.LENGTH_SHORT).show()
+                    }
                 }
                 is LoadingState.Error -> {
                     binding.progressBar.visibility = View.GONE
                     binding.statusText.visibility = View.VISIBLE
                     binding.statusText.text = "Error: ${state.message}"
                     binding.fetchButton.isEnabled = true
+                    downloadInProgress = false
                 }
                 else -> {
                     binding.progressBar.visibility = View.GONE

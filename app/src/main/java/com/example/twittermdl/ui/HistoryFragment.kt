@@ -21,6 +21,7 @@ class HistoryFragment : Fragment() {
 
     private val viewModel: MainViewModel by activityViewModels()
     private lateinit var historyAdapter: DownloadHistoryAdapter
+    private var currentDownloads: List<com.example.twittermdl.data.DownloadHistory> = emptyList()
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -35,18 +36,49 @@ class HistoryFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
 
         setupRecyclerView()
+        setupSwipeRefresh()
         observeViewModel()
     }
 
     private fun setupRecyclerView() {
         historyAdapter = DownloadHistoryAdapter(
             onRedownload = { history ->
-                viewModel.redownloadMedia(history)
-                Toast.makeText(
-                    requireContext(),
-                    "Redownloading media...",
-                    Toast.LENGTH_SHORT
-                ).show()
+                // Fetch fresh tweet data to get video quality variants
+                lifecycleScope.launch {
+                    try {
+                        val result = viewModel.fetchTweetDataForRedownload(history.tweetUrl)
+                        result.onSuccess { tweetData ->
+                            // Check if there are videos with quality variants
+                            val videoWithVariants = tweetData.mediaItems.find {
+                                it.type == com.example.twittermdl.data.MediaType.VIDEO &&
+                                !it.videoVariants.isNullOrEmpty()
+                            }
+
+                            if (videoWithVariants != null && !videoWithVariants.videoVariants.isNullOrEmpty()) {
+                                // Show quality selection dialog
+                                showRedownloadQualityDialog(history, tweetData, videoWithVariants)
+                            } else {
+                                // No quality options, proceed with redownload
+                                viewModel.redownloadMedia(history)
+                                Toast.makeText(
+                                    requireContext(),
+                                    "Redownloading media...",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }.onFailure { _ ->
+                            // Fallback to old redownload method if fetching fails
+                            Toast.makeText(
+                                requireContext(),
+                                "Could not fetch quality options, using default",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            viewModel.redownloadMedia(history)
+                        }
+                    } catch (e: Exception) {
+                        viewModel.redownloadMedia(history)
+                    }
+                }
             },
             onDelete = { history ->
                 viewModel.deleteDownload(history)
@@ -68,6 +100,9 @@ class HistoryFragment : Fragment() {
                         Toast.LENGTH_SHORT
                     ).show()
                 }
+            },
+            onOpenMedia = { history ->
+                openMediaFiles(history)
             }
         )
 
@@ -77,18 +112,129 @@ class HistoryFragment : Fragment() {
         }
     }
 
+    private fun setupSwipeRefresh() {
+        binding.swipeRefreshLayout.setOnRefreshListener {
+            // Force rebind of all items to recheck file existence
+            refreshList()
+        }
+    }
+
+    private fun refreshList() {
+        // Resubmit the current list to force all items to rebind
+        // This will trigger checkMediaFilesExist() for each item
+        if (currentDownloads.isNotEmpty()) {
+            historyAdapter.submitList(null) // Clear first
+            historyAdapter.submitList(currentDownloads) // Then resubmit
+        }
+
+        // Hide the refresh spinner
+        binding.swipeRefreshLayout.isRefreshing = false
+
+        Toast.makeText(
+            requireContext(),
+            "Refreshed history",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun showRedownloadQualityDialog(
+        history: com.example.twittermdl.data.DownloadHistory,
+        tweetData: com.example.twittermdl.data.TweetData,
+        videoItem: com.example.twittermdl.data.MediaItem
+    ) {
+        val dialog = VideoQualityDialog.newInstance(videoItem.videoVariants!!) { selectedVariant ->
+            // Create updated media items with selected quality
+            val updatedMediaItems = tweetData.mediaItems.map { media ->
+                if (media == videoItem) {
+                    media.copy(url = selectedVariant.url)
+                } else {
+                    media
+                }
+            }
+
+            // Update tweet data with new media items
+            val updatedTweetData = tweetData.copy(mediaItems = updatedMediaItems)
+
+            // Download with the selected quality
+            viewModel.downloadSelectedMedia(
+                updatedTweetData,
+                updatedMediaItems,
+                existingHistoryId = history.id
+            )
+
+            Toast.makeText(
+                requireContext(),
+                "Redownloading with selected quality...",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+
+        dialog.show(childFragmentManager, "VideoQualityDialog")
+    }
+
+    private fun openMediaFiles(history: com.example.twittermdl.data.DownloadHistory) {
+        val localPaths = com.example.twittermdl.utils.JsonUtils.jsonToList(history.localFilePaths)
+        val mediaTypes = com.example.twittermdl.utils.JsonUtils.jsonToList(history.mediaTypes)
+
+        if (localPaths.isEmpty()) {
+            Toast.makeText(requireContext(), "No media files found", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        // Open the first media file
+        val firstPath = localPaths[0]
+        val mimeType = when (mediaTypes.getOrNull(0)) {
+            "VIDEO" -> "video/*"
+            "GIF" -> "image/gif"
+            "IMAGE" -> "image/*"
+            "AUDIO" -> "audio/*"
+            else -> "*/*"
+        }
+
+        try {
+            val uri = if (firstPath.startsWith("content://")) {
+                Uri.parse(firstPath)
+            } else {
+                Uri.parse("file://$firstPath")
+            }
+
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mimeType)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+            startActivity(Intent.createChooser(intent, "Open with"))
+        } catch (e: Exception) {
+            Toast.makeText(
+                requireContext(),
+                "Unable to open media: ${e.message}",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
     private fun observeViewModel() {
         lifecycleScope.launch {
             viewModel.allDownloads.collect { downloads ->
+                // Store current downloads for refresh functionality
+                currentDownloads = downloads
+
                 if (downloads.isEmpty()) {
                     binding.emptyView.visibility = View.VISIBLE
                     binding.historyRecyclerView.visibility = View.GONE
+                    binding.swipeRefreshLayout.isEnabled = false // Disable pull-to-refresh when empty
                 } else {
                     binding.emptyView.visibility = View.GONE
                     binding.historyRecyclerView.visibility = View.VISIBLE
+                    binding.swipeRefreshLayout.isEnabled = true // Enable pull-to-refresh
                     historyAdapter.submitList(downloads)
                 }
             }
+        }
+
+        // Observe GIF generation progress
+        viewModel.gifGenerationProgress.observe(viewLifecycleOwner) { progressMap ->
+            historyAdapter.updateGifProgress(progressMap)
         }
     }
 
